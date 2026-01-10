@@ -28,7 +28,7 @@
 
     <a class="navbar-brand me-2" href="../index.html">sparsegl</a>
 
-    <small class="nav-text text-muted me-auto" data-bs-toggle="tooltip" data-bs-placement="bottom" title="">1.1.1.9001</small>
+    <small class="nav-text text-muted me-auto" data-bs-toggle="tooltip" data-bs-placement="bottom" title="">1.1.1.9002</small>
 
 
     <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbar" aria-controls="navbar" aria-expanded="false" aria-label="Toggle navigation">
@@ -285,10 +285,10 @@ in this vector is defined by:
 </ul>
 <div class="sourceCode" id="cb6"><pre class="downlit sourceCode r">
 <code class="sourceCode R"><span><span class="fu"><a href="https://rdrr.io/r/graphics/plot.default.html" class="external-link">plot</a></span><span class="op">(</span><span class="va">fit1</span>, y_axis <span class="op">=</span> <span class="st">"group"</span>, x_axis <span class="op">=</span> <span class="st">"lambda"</span><span class="op">)</span></span></code></pre></div>
-<p><img src="sparsegl_files/figure-html/unnamed-chunk-7-1.png" width="768"></p>
+<p><img src="sparsegl_files/figure-html/unnamed-chunk-7-1.png" class="r-plt" alt="" width="768"></p>
 <div class="sourceCode" id="cb7"><pre class="downlit sourceCode r">
 <code class="sourceCode R"><span><span class="fu"><a href="https://rdrr.io/r/graphics/plot.default.html" class="external-link">plot</a></span><span class="op">(</span><span class="va">fit1</span>, y_axis <span class="op">=</span> <span class="st">"coef"</span>, x_axis <span class="op">=</span> <span class="st">"penalty"</span>, add_legend <span class="op">=</span> <span class="cn">FALSE</span><span class="op">)</span></span></code></pre></div>
-<p><img src="sparsegl_files/figure-html/unnamed-chunk-7-2.png" width="768"></p>
+<p><img src="sparsegl_files/figure-html/unnamed-chunk-7-2.png" class="r-plt" alt="" width="768"></p>
 </div>
 </div>
 <div class="section level2">
@@ -308,7 +308,7 @@ available if <code>family = "binomial"</code>.</p>
 <div class="sourceCode" id="cb8"><pre class="downlit sourceCode r">
 <code class="sourceCode R"><span><span class="va">fit_l1</span> <span class="op">&lt;-</span> <span class="fu"><a href="../reference/cv.sparsegl.html">cv.sparsegl</a></span><span class="op">(</span><span class="va">X</span>, <span class="va">y</span>, group <span class="op">=</span> <span class="va">groups</span>, pred.loss <span class="op">=</span> <span class="st">"mae"</span><span class="op">)</span></span>
 <span><span class="fu"><a href="https://rdrr.io/r/graphics/plot.default.html" class="external-link">plot</a></span><span class="op">(</span><span class="va">fit_l1</span><span class="op">)</span></span></code></pre></div>
-<p><img src="sparsegl_files/figure-html/unnamed-chunk-8-1.png" width="768"></p>
+<p><img src="sparsegl_files/figure-html/unnamed-chunk-8-1.png" class="r-plt" alt="" width="768"></p>
 <div class="section level3">
 <h3 id="methods">Methods<a class="anchor" aria-label="anchor" href="#methods"></a>
 </h3>
@@ -392,7 +392,7 @@ df). For more details about how this formula, see Vaiter, Deledalle,
 Peyré, et al., (<a href="#ref-vaiter">2012</a>).</p>
 <div class="sourceCode" id="cb10"><pre class="downlit sourceCode r">
 <code class="sourceCode R"><span><span class="va">risk</span> <span class="op">&lt;-</span> <span class="fu"><a href="../reference/estimate_risk.html">estimate_risk</a></span><span class="op">(</span><span class="va">fit1</span>, <span class="va">X</span>, approx_df <span class="op">=</span> <span class="cn">FALSE</span><span class="op">)</span></span></code></pre></div>
-<p><img src="sparsegl_files/figure-html/unnamed-chunk-11-1.png" width="768" style="display: block; margin: auto;"></p>
+<p><img src="sparsegl_files/figure-html/unnamed-chunk-11-1.png" class="r-plt" alt="" width="768" style="display: block; margin: auto;"></p>
 </div>
 <div class="section level2">
 <h2 id="references">References<a class="anchor" aria-label="anchor" href="#references"></a>
@@ -421,7 +421,7 @@ Degrees of Freedom of the Group Lasso for a General Design.” <a href="https://
 </div>
 
 <div class="pkgdown-footer-right">
-  <p>Site built with <a href="https://pkgdown.r-lib.org/" class="external-link">pkgdown</a> 2.1.3.</p>
+  <p>Site built with <a href="https://pkgdown.r-lib.org/" class="external-link">pkgdown</a> 2.2.0.</p>
 </div>
 
     </footer>
