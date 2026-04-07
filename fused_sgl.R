@@ -1,0 +1,350 @@
+## fused_sgl.R
+## ----------------------------------------------------------------------------
+## Fused Sparse Group Lasso, built on top of `sparsegl`.
+##
+## Objective (matches sparsegl's normalisation exactly when lambda_fus = 0):
+##
+##   (1/(2n)) * || y - X b ||^2
+##     + (1 - alpha) * lambda * sum_g  pf_group_g  * || b^(g) ||_2
+##     +       alpha * lambda * sum_j  pf_sparse_j * | b_j |
+##     +     lambda_fus       * sum_m  || delta_{m+1} - delta_m ||_2
+##
+## where
+##   * pf_group   defaults to sqrt(bs)         (same as sparsegl)
+##   * pf_sparse  is rescaled internally so that sum(pf_sparse) = nvars
+##                (same as sparsegl)
+##   * delta_m is the coefficient block of the m-th "fusion group" (e.g. age),
+##     and the fusion penalty acts on the L2 norm (NOT squared) of consecutive
+##     differences -- a group-lasso penalty on first differences.
+##
+## Solver:
+##   * lambda_fus == 0  ->  delegate directly to sparsegl (exact match).
+##   * lambda_fus  > 0  ->  ADMM with split z = D b, using sparsegl as the
+##                          inner SGL prox (with the loss-side quadratic
+##                          (rho/2)||Db - v||^2 absorbed into a re-scaled
+##                          augmented design matrix that preserves sparsegl's
+##                          1/(2n) normalisation).
+##
+## The augmented-design rewrite for the b-update:
+##
+##   min_b (1/(2n))||y - Xb||^2 + (rho/2)||Db - v||^2 + SGL_penalty(b)
+##
+##   Let X_full = rbind(X, sqrt(n*rho)*D),  y_full = c(y, sqrt(n*rho)*v),
+##       n_aug  = n + nrow(D),  s = sqrt(n_aug / n).
+##
+##   Then  (1/(2n_aug)) * || s*y_full - s*X_full * b ||^2
+##         = (1/(2n)) * (||y-Xb||^2 + n*rho*||Db - v||^2)
+##         = (1/(2n))||y-Xb||^2 + (rho/2)||Db - v||^2.
+##
+##   Feeding (s*X_full, s*y_full) to sparsegl with `standardize=FALSE`
+##   reproduces the desired loss with the SGL penalty applied unchanged.
+## ----------------------------------------------------------------------------
+
+suppressPackageStartupMessages({
+  if (!requireNamespace("sparsegl", quietly = TRUE)) {
+    stop("This file requires the `sparsegl` package.")
+  }
+})
+
+# ---- helpers ----------------------------------------------------------------
+
+.group_columns <- function(group) {
+  group <- as.integer(group)
+  bs <- as.integer(table(group))
+  cum <- cumsum(c(0L, bs))
+  list(
+    bs = bs,
+    bn = length(bs),
+    col_of = function(g) seq.int(cum[g] + 1L, cum[g] + bs[g])
+  )
+}
+
+.build_diff_matrix <- function(p, group, fuse_groups) {
+  gi <- .group_columns(group)
+  K <- gi$bs[fuse_groups[1]]
+  if (any(gi$bs[fuse_groups] != K)) {
+    stop("All `fuse_groups` must have the same group size.")
+  }
+  M <- length(fuse_groups)
+  D <- matrix(0, nrow = (M - 1L) * K, ncol = p)
+  for (m in seq_len(M - 1L)) {
+    rows <- ((m - 1L) * K + 1L):(m * K)
+    cm   <- gi$col_of(fuse_groups[m])
+    cm1  <- gi$col_of(fuse_groups[m + 1L])
+    D[cbind(rows, cm)]  <- -1
+    D[cbind(rows, cm1)] <-  1
+  }
+  list(D = D, K = K, M = M)
+}
+
+.detect_change_points <- function(beta, group, fuse_groups, tol = 1e-4) {
+  if (is.null(fuse_groups) || length(fuse_groups) < 2L) return(integer(0))
+  gi <- .group_columns(group)
+  cps <- integer(0)
+  for (m in seq_len(length(fuse_groups) - 1L)) {
+    d <- beta[gi$col_of(fuse_groups[m + 1L])] -
+         beta[gi$col_of(fuse_groups[m])]
+    if (sqrt(sum(d * d)) > tol) cps <- c(cps, m)
+  }
+  cps
+}
+
+.bic_from_coef <- function(y, fitted, df, n) {
+  rss <- sum((y - fitted)^2)
+  mse <- rss / n
+  list(bic = log(mse) + log(n) * df / n, mse = mse, rss = rss)
+}
+
+# Pure-SGL path + BIC selection (matches user's reference exactly when called
+# with the same arguments).
+.sgl_bic <- function(X, y, group, alpha, intercept, lambda = NULL, ...) {
+  fit <- sparsegl::sparsegl(
+    x = X, y = y, group = group, asparse = alpha,
+    intercept = intercept, ...
+  )
+  er <- sparsegl::estimate_risk(fit, X, type = "BIC", approx_df = TRUE)
+  if (is.null(lambda)) {
+    idx <- which.min(er$BIC)
+  } else {
+    idx <- which.min(abs(fit$lambda - lambda))
+  }
+  lam <- fit$lambda[idx]
+  co <- as.numeric(stats::coef(fit, s = lam))
+  if (length(co) == ncol(X) + 1L) {
+    b0 <- co[1]; beta <- co[-1]
+  } else {
+    b0 <- 0;     beta <- co
+  }
+  list(beta = beta, b0 = b0, lambda = lam, bic = er$BIC[idx],
+       df = er$df[idx], fit = fit, er = er)
+}
+
+# ---- main entry -------------------------------------------------------------
+
+#' Fused sparse group lasso.
+#'
+#' @param X         numeric matrix (n x p).
+#' @param y         numeric vector length n.
+#' @param group     integer vector length p, sorted, consecutively numbered.
+#' @param alpha     sparse-group mix in [0, 1] (passed as `asparse`).
+#' @param lambda    optional single SGL lambda. If NULL, picked by BIC over the
+#'                  default sparsegl path (using the unfused fit when
+#'                  lambda_fus > 0, which is a sensible warm anchor).
+#' @param lambda_fus fusion penalty strength.
+#' @param fuse_groups vector of group indices, in temporal order, to which
+#'                  fusion applies (consecutive pairs). Required if
+#'                  lambda_fus > 0.
+#' @param intercept logical (default FALSE). Only FALSE is supported when
+#'                  lambda_fus > 0; pre-center y yourself if needed.
+#' @param rho       ADMM penalty parameter.
+#' @param max_iter  ADMM max outer iterations.
+#' @param tol       ADMM stopping tolerance (on primal/dual residuals).
+#' @param cp_tol    threshold for declaring a change point.
+#' @param verbose   print ADMM progress.
+#'
+#' @return list with components: beta, b0, lambda, lambda_fus, alpha, bic,
+#'   mse, df, iters, converged, change_points.
+fused_sgl <- function(X, y, group,
+                      alpha       = 0.85,
+                      lambda      = NULL,
+                      lambda_fus  = 0,
+                      fuse_groups = NULL,
+                      intercept   = FALSE,
+                      rho         = 1,
+                      max_iter    = 500L,
+                      tol         = 1e-6,
+                      cp_tol      = 1e-4,
+                      verbose     = FALSE,
+                      ...) {
+  n <- nrow(X); p <- ncol(X)
+  group <- as.integer(group)
+
+  ## ------ short-circuit: lambda_fus == 0  ------------------------------------
+  if (lambda_fus <= 0) {
+    out <- .sgl_bic(X, y, group, alpha, intercept, lambda = lambda, ...)
+    fitted <- as.numeric(X %*% out$beta) + out$b0
+    info <- .bic_from_coef(y, fitted, out$df, n)
+    return(list(
+      beta          = out$beta,
+      b0            = out$b0,
+      lambda        = out$lambda,
+      lambda_fus    = 0,
+      alpha         = alpha,
+      bic           = out$bic,        # sparsegl-style BIC (matches reference)
+      mse           = info$mse,
+      df            = out$df,
+      iters         = 0L,
+      converged     = TRUE,
+      change_points = .detect_change_points(out$beta, group, fuse_groups, cp_tol)
+    ))
+  }
+
+  ## ------ general case: ADMM -------------------------------------------------
+  if (intercept) {
+    stop("`intercept = TRUE` is not supported when lambda_fus > 0; ",
+         "center y yourself.")
+  }
+  if (is.null(fuse_groups) || length(fuse_groups) < 2L) {
+    stop("`fuse_groups` (length >= 2) is required when lambda_fus > 0.")
+  }
+
+  Dinfo <- .build_diff_matrix(p, group, fuse_groups)
+  D     <- Dinfo$D
+  K     <- Dinfo$K
+  M     <- Dinfo$M
+  m_extra <- nrow(D)
+  n_aug   <- n + m_extra
+  scale_aug <- sqrt(n_aug / n)
+
+  # Pre-build the augmented design: only the bottom block depends on rho.
+  X_top <- scale_aug * X
+  D_blk <- scale_aug * sqrt(n * rho) * D
+
+  ## Pick lambda by BIC on the unfused path if not given.
+  if (is.null(lambda)) {
+    anchor <- .sgl_bic(X, y, group, alpha, intercept = FALSE)
+    lambda <- anchor$lambda
+  }
+
+  ## Inner SGL prox at one lambda. Provide a short geometric warm-start path.
+  inner_sgl <- function(v) {
+    y_full <- c(y, sqrt(n * rho) * v)
+    y_in   <- scale_aug * y_full
+    X_in   <- rbind(X_top, D_blk)
+
+    lam_seq <- exp(seq(log(lambda * 10), log(lambda), length.out = 5L))
+    fit <- sparsegl::sparsegl(
+      x          = X_in,
+      y          = y_in,
+      group      = group,
+      asparse    = alpha,
+      intercept  = FALSE,
+      standardize = FALSE,
+      lambda     = lam_seq
+    )
+    as.numeric(fit$beta[, ncol(fit$beta)])
+  }
+
+  beta <- rep(0, p)
+  Db   <- as.numeric(D %*% beta)
+  z    <- Db
+  u    <- rep(0, length(z))           # scaled dual
+
+  thresh <- lambda_fus / rho
+  iter   <- 0L
+  converged <- FALSE
+  for (it in seq_len(max_iter)) {
+    iter <- it
+    ## b-update.
+    v    <- z + u
+    beta <- inner_sgl(v)
+    Db   <- as.numeric(D %*% beta)
+
+    ## z-update: blockwise group-soft-threshold.
+    z_old  <- z
+    target <- Db - u
+    z      <- numeric(length(target))
+    for (m in seq_len(M - 1L)) {
+      idx <- ((m - 1L) * K + 1L):(m * K)
+      tm  <- target[idx]
+      nm  <- sqrt(sum(tm * tm))
+      if (nm > thresh) z[idx] <- tm * (1 - thresh / nm)
+    }
+
+    ## dual update.
+    u <- u + z - Db
+
+    ## stopping criterion (Boyd et al. 2011 style).
+    pri_res <- sqrt(sum((Db - z)^2))
+    dua_res <- rho * sqrt(sum((z - z_old)^2))
+    pri_tol <- tol * sqrt(length(z) + 1)
+    dua_tol <- tol * sqrt(p + 1)
+
+    if (verbose && (it %% 10 == 0 || it == 1)) {
+      cat(sprintf("[fused_sgl] iter=%4d  pri=%.3e  dua=%.3e\n",
+                  it, pri_res, dua_res))
+    }
+    if (pri_res < pri_tol && dua_res < dua_tol) {
+      converged <- TRUE
+      break
+    }
+  }
+
+  fitted <- as.numeric(X %*% beta)
+  df     <- sum(abs(beta) > 1e-8)
+  info   <- .bic_from_coef(y, fitted, df, n)
+
+  list(
+    beta          = beta,
+    b0            = 0,
+    lambda        = lambda,
+    lambda_fus    = lambda_fus,
+    alpha         = alpha,
+    bic           = info$bic,
+    mse           = info$mse,
+    df            = df,
+    iters         = iter,
+    converged     = converged,
+    change_points = .detect_change_points(beta, group, fuse_groups, cp_tol)
+  )
+}
+
+# ---- grid-search wrapper ----------------------------------------------------
+
+#' Joint BIC selection of (alpha, lambda, lambda_fus).
+#'
+#' For each (alpha, lambda_fus), the lambda grid is taken from a fresh
+#' sparsegl path at that alpha (with lambda_fus = 0). For lambda_fus = 0
+#' we let `.sgl_bic` pick lambda directly, otherwise each lambda is tried.
+fused_sgl_grid <- function(X, y, group,
+                           alpha_grid      = c(0.5, 0.75, 0.9, 0.95),
+                           lambda_fus_grid = c(0, 1e-3, 1e-2, 1e-1),
+                           fuse_groups     = NULL,
+                           intercept       = FALSE,
+                           nlambda         = 30L,
+                           verbose         = FALSE,
+                           ...) {
+  records <- list()
+  best <- NULL
+  best_bic <- Inf
+
+  for (a in alpha_grid) {
+    path <- sparsegl::sparsegl(
+      x = X, y = y, group = group, asparse = a,
+      intercept = intercept, nlambda = nlambda
+    )
+    lam_grid <- path$lambda
+
+    for (lf in lambda_fus_grid) {
+      if (lf == 0) {
+        r <- fused_sgl(X, y, group, alpha = a, lambda = NULL,
+                       lambda_fus = 0, fuse_groups = fuse_groups,
+                       intercept = intercept, ...)
+        records[[length(records) + 1L]] <-
+          data.frame(alpha = a, lambda = r$lambda, lambda_fus = 0,
+                     bic = r$bic, df = r$df)
+        if (r$bic < best_bic) { best_bic <- r$bic; best <- r }
+      } else {
+        for (lam in lam_grid) {
+          r <- tryCatch(
+            fused_sgl(X, y, group, alpha = a, lambda = lam,
+                      lambda_fus = lf, fuse_groups = fuse_groups,
+                      intercept = intercept, verbose = FALSE, ...),
+            error = function(e) NULL
+          )
+          if (is.null(r)) next
+          records[[length(records) + 1L]] <-
+            data.frame(alpha = a, lambda = lam, lambda_fus = lf,
+                       bic = r$bic, df = r$df)
+          if (verbose) {
+            cat(sprintf("a=%.2f lf=%.2e lam=%.4g  bic=%.4f\n",
+                        a, lf, lam, r$bic))
+          }
+          if (r$bic < best_bic) { best_bic <- r$bic; best <- r }
+        }
+      }
+    }
+  }
+  best$grid <- do.call(rbind, records)
+  best
+}
