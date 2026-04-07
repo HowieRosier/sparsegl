@@ -19,25 +19,25 @@
 ##
 ## Solver:
 ##   * lambda_fus == 0  ->  delegate directly to sparsegl (exact match).
-##   * lambda_fus  > 0  ->  ADMM with split z = D b, using sparsegl as the
-##                          inner SGL prox (with the loss-side quadratic
-##                          (rho/2)||Db - v||^2 absorbed into a re-scaled
-##                          augmented design matrix that preserves sparsegl's
-##                          1/(2n) normalisation).
+##   * lambda_fus  > 0  ->  ADMM with split z = D b. The b-update
 ##
-## The augmented-design rewrite for the b-update:
+##         min_b (1/(2n))||y - Xb||^2 + (rho/2)||Db - v||^2 + SGL_penalty(b)
 ##
-##   min_b (1/(2n))||y - Xb||^2 + (rho/2)||Db - v||^2 + SGL_penalty(b)
+##     is solved by a small block coordinate descent that mimics sparsegl's
+##     Fortran update_step exactly: per-group prox-gradient with
+##         grad_g = -(1/n) X_g' r + rho D_g' q       (r = y-Xb, q = Db-v)
+##         step   = 1 / L_g, L_g = max-eig of (X_g'X_g)/n + rho D_g'D_g
+##         s      = b_g - step * grad_g
+##         s      <- soft_thresh(s, step * alpha * lambda * pf_sparse_g)
+##         b_g    <- s * max(0, 1 - step*(1-alpha)*lambda*pf_group_g / ||s||)
+##     using pf_group = sqrt(|g|) and pf_sparse = 1 (the sparsegl defaults,
+##     and pf_sparse already sums to nvars so no rescaling is needed).
 ##
-##   Let X_full = rbind(X, sqrt(n*rho)*D),  y_full = c(y, sqrt(n*rho)*v),
-##       n_aug  = n + nrow(D),  s = sqrt(n_aug / n).
-##
-##   Then  (1/(2n_aug)) * || s*y_full - s*X_full * b ||^2
-##         = (1/(2n)) * (||y-Xb||^2 + n*rho*||Db - v||^2)
-##         = (1/(2n))||y-Xb||^2 + (rho/2)||Db - v||^2.
-##
-##   Feeding (s*X_full, s*y_full) to sparsegl with `standardize=FALSE`
-##   reproduces the desired loss with the SGL penalty applied unchanged.
+##     We do NOT call sparsegl as the inner solver: feeding it an augmented
+##     (X; sqrt(n*rho)*D) design crashes RSpectra::svds inside calc_gamma()
+##     because the difference block is highly singular ("TridiagEigen: eigen
+##     decomposition failed"). Solving the b-update directly avoids that
+##     entirely and warm-starts naturally between ADMM iterations.
 ## ----------------------------------------------------------------------------
 
 suppressPackageStartupMessages({
@@ -192,13 +192,6 @@ fused_sgl <- function(X, y, group,
   D     <- Dinfo$D
   K     <- Dinfo$K
   M     <- Dinfo$M
-  m_extra <- nrow(D)
-  n_aug   <- n + m_extra
-  scale_aug <- sqrt(n_aug / n)
-
-  # Pre-build the augmented design: only the bottom block depends on rho.
-  X_top <- scale_aug * X
-  D_blk <- scale_aug * sqrt(n * rho) * D
 
   ## Pick lambda by BIC on the unfused path if not given.
   if (is.null(lambda)) {
@@ -206,23 +199,80 @@ fused_sgl <- function(X, y, group,
     lambda <- anchor$lambda
   }
 
-  ## Inner SGL prox at one lambda. Provide a short geometric warm-start path.
-  inner_sgl <- function(v) {
-    y_full <- c(y, sqrt(n * rho) * v)
-    y_in   <- scale_aug * y_full
-    X_in   <- rbind(X_top, D_blk)
+  ## Group bookkeeping (matches sparsegl defaults).
+  gi <- .group_columns(group)
+  bs <- gi$bs
+  bn <- gi$bn
+  pf_group  <- sqrt(bs)              # default sparsegl pf_group
+  pf_sparse <- rep(1, p)             # already sums to nvars, no rescale needed
+  cum <- cumsum(c(0L, bs))
+  group_cols <- lapply(seq_len(bn), function(g) seq.int(cum[g] + 1L, cum[g] + bs[g]))
 
-    lam_seq <- exp(seq(log(lambda * 10), log(lambda), length.out = 5L))
-    fit <- sparsegl::sparsegl(
-      x          = X_in,
-      y          = y_in,
-      group      = group,
-      asparse    = alpha,
-      intercept  = FALSE,
-      standardize = FALSE,
-      lambda     = lam_seq
-    )
-    as.numeric(fit$beta[, ncol(fit$beta)])
+  ## Pre-extract per-group X_g and D_g, and per-group Lipschitz constants
+  ## L_g = max-eigenvalue of (X_g'X_g)/n + rho * D_g'D_g.
+  Xg_list <- vector("list", bn)
+  Dg_list <- vector("list", bn)
+  Lg      <- numeric(bn)
+  for (g in seq_len(bn)) {
+    cg <- group_cols[[g]]
+    Xg <- X[, cg, drop = FALSE]
+    Dg <- D[, cg, drop = FALSE]
+    Xg_list[[g]] <- Xg
+    Dg_list[[g]] <- Dg
+    A <- crossprod(Xg) / n + rho * crossprod(Dg)
+    if (length(cg) == 1L) {
+      Lg[g] <- as.numeric(A)
+    } else {
+      Lg[g] <- max(eigen(A, symmetric = TRUE, only.values = TRUE)$values)
+    }
+  }
+  Lg <- pmax(Lg, 1e-12)
+
+  lama   <- alpha * lambda
+  lam1ma <- (1 - alpha) * lambda
+
+  ## Inner b-update: block coordinate descent on
+  ##   (1/(2n))||y - Xb||^2 + (rho/2)||Db - v||^2 + SGL(b)
+  ## Maintains residuals r = y - X b and q = D b - v incrementally.
+  inner_bcd <- function(beta_init, v, max_inner = 100L, inner_tol = 1e-9) {
+    beta <- beta_init
+    r <- as.numeric(y - X %*% beta)
+    q <- as.numeric(D %*% beta - v)
+    for (it_in in seq_len(max_inner)) {
+      max_change <- 0
+      for (g in seq_len(bn)) {
+        cg <- group_cols[[g]]
+        Xg <- Xg_list[[g]]
+        Dg <- Dg_list[[g]]
+        bg_old <- beta[cg]
+        ## gradient of smooth part wrt b_g: -(1/n) X_g' r + rho D_g' q
+        grad_g <- -as.numeric(crossprod(Xg, r)) / n +
+                  rho * as.numeric(crossprod(Dg, q))
+        t_g <- 1 / Lg[g]
+        s   <- bg_old - t_g * grad_g
+        ## L1 soft-threshold (per-coordinate).
+        thr_l1 <- t_g * lama * pf_sparse[cg]
+        s <- sign(s) * pmax(abs(s) - thr_l1, 0)
+        ## group threshold.
+        snorm <- sqrt(sum(s * s))
+        thr_g <- t_g * lam1ma * pf_group[g]
+        if (snorm > thr_g) {
+          bg_new <- s * (1 - thr_g / snorm)
+        } else {
+          bg_new <- numeric(length(cg))
+        }
+        d <- bg_new - bg_old
+        if (any(d != 0)) {
+          beta[cg] <- bg_new
+          r <- r - as.numeric(Xg %*% d)
+          q <- q + as.numeric(Dg %*% d)
+          ch <- Lg[g] * sum(d * d)
+          if (ch > max_change) max_change <- ch
+        }
+      }
+      if (max_change < inner_tol) break
+    }
+    beta
   }
 
   beta <- rep(0, p)
@@ -235,9 +285,9 @@ fused_sgl <- function(X, y, group,
   converged <- FALSE
   for (it in seq_len(max_iter)) {
     iter <- it
-    ## b-update.
+    ## b-update via block coordinate descent (warm-started from previous beta).
     v    <- z + u
-    beta <- inner_sgl(v)
+    beta <- inner_bcd(beta, v)
     Db   <- as.numeric(D %*% beta)
 
     ## z-update: blockwise group-soft-threshold.
